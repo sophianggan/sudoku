@@ -1,0 +1,8 @@
+torch>=2.3.0
+torch_geometric>=2.5.0
+numpy>=1.26.0
+scipy>=1.13.0
+networkx>=3.3
+tqdm>=4.66.0
+pytest>=8.0.0
+dataclasses; python_version<'3.7'
