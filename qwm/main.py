@@ -5,13 +5,15 @@ import sys
 import pathlib
 import json
 import numpy as np
+import torch
 from qwm.config import Config
-from qwm.data.sudoku_generator import generate_dataset, board_from_string
+from qwm.data.sudoku_generator import generate_dataset, board_from_string, get_candidate_set
 from qwm.data.equivalence_labeler import generate_equivalent_pairs
 from qwm.training.dataset import QWMDataset, PairDataset
 from qwm.training.trainer import QWMTrainer
 from qwm.search.verifier import SudokuVerifier
 from qwm.search.controller import QWMController
+from qwm.search.dag import QuotientDAG
 from qwm.evaluation.metrics import Evaluator
 
 # ────────────────────────────────────────────────────────────────────
@@ -65,7 +67,6 @@ def evaluate():
             return super().encode_state(board)
         def search(self, initial_board, max_nodes=500):
             # Patch QuotientDAG to never merge
-            from qwm.search.dag import QuotientDAG
             dag = QuotientDAG(merge_threshold=2.0)  # never merge
             verifier = self.verifier
             z0 = self.encode_state(initial_board)

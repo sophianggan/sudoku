@@ -5,10 +5,21 @@ Implements node addition, merging, pruning, and statistics for QWM search.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import Any, List, Dict, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+def _copy_state(state: Any) -> Any:
+    """Return a copy of *state* if it supports .copy(), otherwise return as-is.
+
+    numpy arrays need .copy() to avoid aliasing.
+    Immutable objects (ProofState, frozensets, etc.) are safe to share.
+    """
+    if hasattr(state, "copy"):
+        return state.copy()
+    return state
 
 @dataclass
 class DAGNode:
@@ -44,7 +55,7 @@ class QuotientDAG:
         node = DAGNode(
             node_id=self.next_id,
             z=z.detach().cpu(),
-            board_state=board_state.copy(),
+            board_state=_copy_state(board_state),
         )
         self.nodes[self.next_id] = node
         self.frontier.append(self.next_id)
@@ -74,7 +85,7 @@ class QuotientDAG:
         node = DAGNode(
             node_id=self.next_id,
             z=z,
-            board_state=board_state.copy(),
+            board_state=_copy_state(board_state),
             parent_ids=[parent_id],
             value_score=value_score,
             obstruction_risk=obstruction_risk,
