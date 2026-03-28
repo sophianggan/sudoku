@@ -150,7 +150,7 @@ class _LeanDojoImpl(_BaseImpl):
         if isinstance(result, LDTacticError):
             raise TacticError(str(result), error_type="tactic_error")
         if isinstance(result, ProofFinished):
-            return ProofState(goals=[], _lean_state=result)
+            return ProofState(goals=[])
         # result is a new TacticState
         return ProofState.from_lean_dojo(result)
 

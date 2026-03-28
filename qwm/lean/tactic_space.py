@@ -19,9 +19,12 @@ returning a ranked list of tactic strings for a given ProofState.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional, TYPE_CHECKING
 
 from qwm.lean.proof_state import ProofState
+
+if TYPE_CHECKING:
+    from qwm.lean.lemma_retriever import LemmaRetriever
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,13 +97,28 @@ class TacticProposer:
 
     Implements the BaseActionProposer protocol.
 
+    Parameters
+    ----------
+    lemma_retriever:
+        Optional :class:`~qwm.lean.lemma_retriever.LemmaRetriever` instance.
+        When provided, its :meth:`retrieve` method is called to obtain
+        environment-specific lemma names that supplement or replace the
+        hardcoded ``COMMON_LEMMAS`` list.  Pass ``None`` (default) to use
+        the static list — suitable for mock / no-Lean environments.
+
     Priority order
     --------------
     1. Closing tactics (most likely to terminate search quickly)
     2. Parameterised tactics using current hypothesis names
-    3. Parameterised tactics using common lemma names
-    4. Structural tactics
+    3. Intro if goal is a ∀
+    4. Parameterised tactics using retrieved / common lemma names
     """
+
+    def __init__(
+        self,
+        lemma_retriever: Optional["LemmaRetriever"] = None,
+    ) -> None:
+        self._lemma_retriever = lemma_retriever
 
     def propose(self, state: ProofState, top_k: int = 5) -> List[str]:
         """Return up to *top_k* candidate tactic strings for *state*."""
@@ -127,8 +145,13 @@ class TacticProposer:
         if target.strip().startswith("∀"):
             tactics.insert(0, "intro h")  # high priority
 
-        # 4. Common lemma applications
-        for lemma in COMMON_LEMMAS:
+        # 4. Lemma applications — dynamic retrieval when available, else static
+        lemma_names = (
+            self._lemma_retriever.retrieve(state)
+            if self._lemma_retriever is not None
+            else COMMON_LEMMAS
+        )
+        for lemma in lemma_names:
             tactics.append(f"apply {lemma}")
             tactics.append(f"rw [{lemma}]")
 

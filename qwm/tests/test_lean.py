@@ -17,8 +17,10 @@ import torch
 from qwm.lean.proof_state import Goal, Hypothesis, ProofState, _tokenize
 from qwm.lean.proof_graph import LeanProofGraphEncoder
 from qwm.lean.lean_verifier import LeanVerifier
-from qwm.lean.tactic_space import TacticProposer
+from qwm.lean.lemma_retriever import LemmaRetriever
+from qwm.lean.tactic_space import TacticProposer, COMMON_LEMMAS
 from qwm.lean.dataset import generate_lean_dataset
+from qwm.lean.theorem_loader import DEFAULT_MATHLIB_THEOREMS, load_theorems_from_repo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,3 +293,119 @@ class TestLeanQWMController:
         ps = ProofState.from_string("⊢ 3 + 5 = 8")
         result = controller.search(ps, max_nodes=100)
         assert isinstance(result["proved"], bool)
+
+    def test_search_result_has_proof_tactics_key(self):
+        controller = self._make_controller()
+        ps = ProofState.from_string("⊢ 1 + 1 = 2")
+        result = controller.search(ps, max_nodes=50)
+        assert "proof_tactics" in result
+        assert isinstance(result["proof_tactics"], list)
+
+    def test_search_already_proved_state(self):
+        """A proof state with no goals should return proved=True immediately."""
+        controller = self._make_controller()
+        ps = ProofState(goals=[])
+        result = controller.search(ps, max_nodes=50)
+        assert result["proved"] is True
+        assert result["nodes_expanded"] == 0
+        assert result["proof_tactics"] == []
+
+    def test_proof_tactics_are_strings_when_proved(self):
+        controller = self._make_controller()
+        ps = ProofState.from_string("⊢ 2 + 2 = 4")
+        result = controller.search(ps, max_nodes=200)
+        if result["proved"]:
+            assert all(isinstance(t, str) for t in result["proof_tactics"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LemmaRetriever (mock mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLemmaRetriever:
+    def test_fallback_returns_common_lemmas(self):
+        """Without a dojo, retriever returns items from COMMON_LEMMAS."""
+        retriever = LemmaRetriever()
+        ps = ProofState.from_string("⊢ 1 + 1 = 2")
+        lemmas = retriever.retrieve(ps)
+        assert isinstance(lemmas, list)
+        assert len(lemmas) > 0
+        assert all(isinstance(l, str) for l in lemmas)
+
+    def test_fallback_respects_max_lemmas(self):
+        retriever = LemmaRetriever(max_lemmas=3)
+        ps = ProofState.from_string("⊢ 1 = 1")
+        lemmas = retriever.retrieve(ps)
+        assert len(lemmas) <= 3
+
+    def test_fallback_no_lean_state(self):
+        """Even with dojo=None, retriever must not crash."""
+        retriever = LemmaRetriever(dojo=None)
+        ps = ProofState.from_string("h : n > 0\n⊢ n > 0")
+        lemmas = retriever.retrieve(ps)
+        assert len(lemmas) > 0
+
+    def test_repr(self):
+        r = LemmaRetriever()
+        assert "fallback" in repr(r)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TacticProposer with LemmaRetriever
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTacticProposerWithRetriever:
+    def test_proposer_accepts_retriever(self):
+        retriever = LemmaRetriever()
+        proposer = TacticProposer(lemma_retriever=retriever)
+        ps = ProofState.from_string("⊢ 2 + 2 = 4")
+        tactics = proposer.propose(ps, top_k=20)
+        assert len(tactics) > 0
+
+    def test_proposer_with_retriever_includes_apply(self):
+        retriever = LemmaRetriever(max_lemmas=5)
+        proposer = TacticProposer(lemma_retriever=retriever)
+        ps = ProofState.from_string("⊢ 2 * 1 = 2")
+        tactics = proposer.all_tactics(ps)
+        apply_tactics = [t for t in tactics if t.startswith("apply ")]
+        assert len(apply_tactics) > 0
+
+    def test_no_retriever_uses_common_lemmas(self):
+        """Default proposer (no retriever) must still include common lemma tactics."""
+        proposer = TacticProposer()
+        ps = ProofState.from_string("⊢ 1 + 0 = 1")
+        tactics = proposer.all_tactics(ps)
+        lemma_tactics = [t for t in tactics if t.startswith("apply ") or t.startswith("rw [")]
+        assert len(lemma_tactics) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Theorem loader (no lean_dojo required — tests static metadata only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTheoremLoader:
+    def test_default_list_nonempty(self):
+        assert len(DEFAULT_MATHLIB_THEOREMS) > 0
+
+    def test_default_list_entries_are_pairs(self):
+        for entry in DEFAULT_MATHLIB_THEOREMS:
+            assert len(entry) == 2
+            file_path, thm_name = entry
+            assert isinstance(file_path, str) and file_path.endswith(".lean")
+            assert isinstance(thm_name, str) and len(thm_name) > 0
+
+    def test_load_requires_lean_dojo(self):
+        """load_theorems_from_repo raises ImportError when lean_dojo absent."""
+        import importlib
+        import sys
+        # Temporarily hide lean_dojo if it happens to be installed
+        original = sys.modules.get("lean_dojo")
+        sys.modules["lean_dojo"] = None  # type: ignore[assignment]
+        try:
+            with pytest.raises((ImportError, TypeError)):
+                load_theorems_from_repo("https://example.com", "abc123", [])
+        finally:
+            if original is None:
+                sys.modules.pop("lean_dojo", None)
+            else:
+                sys.modules["lean_dojo"] = original

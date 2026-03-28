@@ -29,8 +29,9 @@ from typing import List
 import torch
 
 from qwm.config import Config
-from qwm.lean.dataset import generate_lean_dataset
+from qwm.lean.dataset import generate_lean_dataset, generate_lean_dataset_from_dojo
 from qwm.lean.lean_verifier import LeanVerifier
+from qwm.lean.lemma_retriever import LemmaRetriever
 from qwm.lean.proof_state import ProofState
 from qwm.lean.controller import LeanQWMController
 from qwm.lean.tactic_space import TacticProposer
@@ -61,6 +62,20 @@ def _proof_traces_to_solver_traces(proof_traces):
     encoder = LeanProofGraphEncoder()
     obs_index = {c: i for i, c in enumerate(OBSTRUCTION_CLASSES)}
 
+    # Map Lean tactic error strings to the 6 Sudoku-compatible obstruction classes.
+    # The mapping is semantic: Lean errors that signal "dead end / contradiction"
+    # are mapped to the most structurally similar Sudoku failure mode.
+    _LEAN_OBS_MAP = {
+        "tactic_failed":       "empty_domain",        # tactic cannot make progress
+        "unsupported_tactic":  "empty_domain",        # tactic not applicable
+        "unknown_identifier":  "naked_single_violation",  # reference not in scope
+        "apply_error":         "hidden_single_violation",  # wrong lemma shape
+        "no_goals":            "box_conflict",         # proof already done / overshoot
+        "missing_lean_state":  "row_conflict",         # internal state error
+        "proof_already_complete": "box_conflict",
+    }
+    _DEFAULT_OBS = "row_conflict"
+
     class _WrappedTrace:
         def __init__(self, pt):
             self.board_before = encoder.encode(pt.state_before)
@@ -71,14 +86,9 @@ def _proof_traces_to_solver_traces(proof_traces):
             )
             self.action = (0, 0, 0)  # placeholder
             self.branch_failed = not pt.branch_succeeded
-            # Map Lean obstruction types to the 6 Sudoku classes as best-effort
+            # Map Lean obstruction type string to a Sudoku obstruction class
             lean_obs = pt.obstruction_type or ""
-            if "tactic_failed" in lean_obs or "unsupported" in lean_obs:
-                self.obstruction_type = "empty_domain"
-            elif "unknown_identifier" in lean_obs:
-                self.obstruction_type = "naked_single_violation"
-            else:
-                self.obstruction_type = "row_conflict"  # default fallback
+            self.obstruction_type = _LEAN_OBS_MAP.get(lean_obs, _DEFAULT_OBS)
             self.solvability_label = pt.solvability_label
 
     return [_WrappedTrace(pt) for pt in proof_traces]
@@ -214,6 +224,177 @@ def demo():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Train with real lean_dojo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_dojo(
+    repo_url: str,
+    commit: str,
+    max_theorems: int = 50,
+    n_epochs: int = 30,
+):
+    """Train QWM on real Lean theorems via lean_dojo.
+
+    Parameters
+    ----------
+    repo_url:
+        Git URL of the Lean repository (e.g. Mathlib4).
+    commit:
+        Commit hash or tag to check out.
+    max_theorems:
+        Number of theorems to load from the default curated list.
+    n_epochs:
+        Training epochs.
+    """
+    try:
+        from lean_dojo import Dojo
+        from qwm.lean.theorem_loader import load_default_mathlib_theorems
+    except ImportError:
+        print("lean_dojo is not installed.  Run: pip install lean-dojo")
+        sys.exit(1)
+
+    config = Config()
+    print(f"[QWM-Lean] Loading up to {max_theorems} Mathlib theorems via lean_dojo...")
+    theorems = load_default_mathlib_theorems(
+        repo_url=repo_url, commit=commit, max_theorems=max_theorems
+    )
+    print(f"[QWM-Lean] Loaded {len(theorems)} theorems.")
+
+    if not theorems:
+        print("[QWM-Lean] No theorems loaded — check repo_url / commit.")
+        sys.exit(1)
+
+    print("[QWM-Lean] Generating proof traces with real Lean...")
+    proof_traces = generate_lean_dataset_from_dojo(
+        theorems,
+        max_traces_per_theorem=100,
+        max_depth=12,
+        seed=config.seed,
+    )
+    print(f"[QWM-Lean] Total traces: {len(proof_traces)}")
+
+    if not proof_traces:
+        print("[QWM-Lean] No traces generated.  Check Lean installation.")
+        sys.exit(1)
+
+    wrapped = _proof_traces_to_solver_traces(proof_traces)
+
+    from qwm.training.dataset import QWMDataset
+    from torch.utils.data import DataLoader
+
+    dataset = QWMDataset(wrapped)
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        collate_fn=QWMTrainer._collate,
+    )
+
+    print("[QWM-Lean] Training QWM on real Lean traces...")
+    trainer = QWMTrainer(config)
+    trainer.train(n_epochs=n_epochs, dataloader=loader)
+
+    ckpt_path = pathlib.Path("checkpoints/qwm_lean_dojo.pt")
+    trainer.save_checkpoint(ckpt_path)
+    print(f"[QWM-Lean] Checkpoint saved to {ckpt_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate with real lean_dojo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_dojo(
+    repo_url: str,
+    commit: str,
+    max_theorems: int = 20,
+):
+    """Evaluate QWM on real Lean theorems, printing metrics and proof tactics.
+
+    Parameters
+    ----------
+    repo_url, commit:
+        Repository and revision for lean_dojo.
+    max_theorems:
+        Number of theorems to evaluate on.
+    """
+    try:
+        from lean_dojo import Dojo
+        from qwm.lean.theorem_loader import load_default_mathlib_theorems
+    except ImportError:
+        print("lean_dojo is not installed.  Run: pip install lean-dojo")
+        sys.exit(1)
+
+    config = Config()
+    ckpt_path = pathlib.Path("checkpoints/qwm_lean_dojo.pt")
+    if not ckpt_path.exists():
+        ckpt_path = pathlib.Path("checkpoints/qwm_lean.pt")
+    print(f"[QWM-Lean] Loading checkpoint from {ckpt_path}...")
+    trainer = QWMTrainer(config)
+    if ckpt_path.exists():
+        trainer.load_checkpoint(ckpt_path)
+    else:
+        print("[QWM-Lean] No checkpoint found — using random weights.")
+
+    print(f"[QWM-Lean] Loading up to {max_theorems} Mathlib theorems...")
+    theorems = load_default_mathlib_theorems(
+        repo_url=repo_url, commit=commit, max_theorems=max_theorems
+    )
+    print(f"[QWM-Lean] Evaluating on {len(theorems)} theorems...")
+
+    n_proved = 0
+    total_nodes = 0
+    total_merges = 0
+    total_verifier_calls = 0
+
+    for theorem in theorems:
+        try:
+            with Dojo(theorem) as (dojo, init_state):
+                verifier = LeanVerifier(dojo=dojo)
+                retriever = LemmaRetriever(dojo=dojo)
+                initial_ps = ProofState.from_lean_dojo(init_state)
+                controller = LeanQWMController(
+                    trainer.get_models_dict(), config, verifier,
+                    lemma_retriever=retriever,
+                )
+                result = controller.search(initial_ps, max_nodes=300)
+        except Exception as exc:
+            print(f"  [skip] {theorem.full_name}: {exc}")
+            continue
+
+        proved = result["proved"]
+        if proved:
+            n_proved += 1
+            tactics_str = " → ".join(result["proof_tactics"]) or "(trivial)"
+            print(f"  [proved] {theorem.full_name}: {tactics_str}")
+        else:
+            print(f"  [failed] {theorem.full_name}")
+
+        total_nodes += result["nodes_expanded"]
+        total_merges += result["merges_performed"]
+        total_verifier_calls += result["verifier_calls"]
+
+    n = len(theorems)
+    if n == 0:
+        print("[QWM-Lean] No theorems evaluated.")
+        return
+
+    metrics = {
+        "prove_rate": n_proved / n,
+        "avg_nodes_expanded": total_nodes / n,
+        "avg_merges": total_merges / n,
+        "avg_verifier_calls": total_verifier_calls / n,
+    }
+    print("\n=== QWM Lean Dojo Evaluation Results ===")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.3f}")
+
+    pathlib.Path("results").mkdir(exist_ok=True)
+    with open("results/lean_dojo_eval.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    print("[QWM-Lean] Results saved to results/lean_dojo_eval.json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Demo with real lean_dojo
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -237,12 +418,18 @@ def demo_dojo(repo_url: str, commit: str, file_path: str, theorem_name: str):
     print(f"[QWM-Lean] Proving {theorem_name} from {file_path}...")
     with Dojo(theorem) as (dojo, init_state):
         verifier = LeanVerifier(dojo=dojo)
+        retriever = LemmaRetriever(dojo=dojo)
         initial_ps = ProofState.from_lean_dojo(init_state)
-        controller = LeanQWMController(trainer.get_models_dict(), config, verifier)
+        controller = LeanQWMController(
+            trainer.get_models_dict(), config, verifier,
+            lemma_retriever=retriever,
+        )
         result = controller.search(initial_ps, max_nodes=500)
 
     if result["proved"]:
         print(f"[QWM-Lean] Proved {theorem_name}!")
+        if result["proof_tactics"]:
+            print("  Proof: " + " → ".join(result["proof_tactics"]))
     else:
         print(f"[QWM-Lean] Could not prove {theorem_name} within budget.")
     print(f"  Nodes: {result['nodes_expanded']}  "
@@ -266,6 +453,18 @@ if __name__ == "__main__":
         evaluate()
     elif cmd == "demo":
         demo()
+    elif cmd == "train_dojo":
+        if len(sys.argv) < 4:
+            print("Usage: python qwm/lean_main.py train_dojo <repo_url> <commit> [max_theorems]")
+            sys.exit(1)
+        max_t = int(sys.argv[4]) if len(sys.argv) > 4 else 50
+        train_dojo(sys.argv[2], sys.argv[3], max_theorems=max_t)
+    elif cmd == "evaluate_dojo":
+        if len(sys.argv) < 4:
+            print("Usage: python qwm/lean_main.py evaluate_dojo <repo_url> <commit> [max_theorems]")
+            sys.exit(1)
+        max_t = int(sys.argv[4]) if len(sys.argv) > 4 else 20
+        evaluate_dojo(sys.argv[2], sys.argv[3], max_theorems=max_t)
     elif cmd == "demo_dojo":
         if len(sys.argv) < 6:
             print("Usage: python qwm/lean_main.py demo_dojo <repo_url> <commit> <file> <theorem>")
