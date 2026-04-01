@@ -201,6 +201,49 @@ def evaluate():
     print("[QWM] Results saved to results/sudoku_eval.json")
 
 # ────────────────────────────────────────────────────────────────────
+# Resume train (continue from latest epoch checkpoint)
+# ────────────────────────────────────────────────────────────────────
+def train_resume(remaining_epochs: int = 20):
+    """Resume Sudoku training from the latest epoch checkpoint.
+
+    Loads the most recent ``checkpoints/qwm_epoch_*.pt``, generates the same
+    training data (same seed), then trains for *remaining_epochs* more epochs
+    before saving the final ``checkpoints/qwm_sudoku.pt``.
+    """
+    config = Config()
+
+    # Find the latest epoch checkpoint
+    ckpt_dir = pathlib.Path("checkpoints")
+    epoch_ckpts = sorted(ckpt_dir.glob("qwm_epoch_*.pt"))
+    if not epoch_ckpts:
+        print("[QWM] No epoch checkpoints found — running full train instead.")
+        train()
+        return
+
+    resume_path = epoch_ckpts[-1]
+    print(f"[QWM] Resuming from {resume_path} for {remaining_epochs} more epochs...")
+
+    print("[QWM] Generating Sudoku training data (same seed)...")
+    dataset = generate_dataset(n_puzzles=10000, seed=config.seed, max_traces_per_puzzle=200)
+    all_traces = [trace for _, traces in dataset for trace in traces]
+    print(f"[QWM] Total traces: {len(all_traces)}")
+    pairs = generate_equivalent_pairs(all_traces, n_pairs=5000, seed=config.seed)
+    pairds = PairDataset(all_traces, pairs, n_neg=4)
+
+    from torch.utils.data import DataLoader
+    loader = DataLoader(pairds, batch_size=config.batch_size, shuffle=True, collate_fn=QWMTrainer._collate)
+
+    trainer = QWMTrainer(config)
+    trainer.load_checkpoint(resume_path)
+    print(f"[QWM] Training {remaining_epochs} more epochs...")
+    trainer.train(n_epochs=remaining_epochs, dataloader=loader)
+
+    ckpt_path = pathlib.Path("checkpoints/qwm_sudoku.pt")
+    trainer.save_checkpoint(ckpt_path)
+    print(f"[QWM] Final checkpoint saved to {ckpt_path}")
+
+
+# ────────────────────────────────────────────────────────────────────
 # Demo
 # ────────────────────────────────────────────────────────────────────
 def demo():
@@ -234,6 +277,9 @@ if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "train":
         train()
+    elif cmd == "train_resume":
+        epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+        train_resume(remaining_epochs=epochs)
     elif cmd == "evaluate":
         evaluate()
     elif cmd == "demo":
