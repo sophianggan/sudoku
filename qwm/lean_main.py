@@ -95,6 +95,42 @@ def _proof_traces_to_solver_traces(proof_traces):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Lean-specific Dataset (works with _WrappedTrace, not SolverTrace)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LeanQWMDataset:
+    """Dataset for _WrappedTrace objects from the Lean proof pipeline.
+
+    _WrappedTrace stores pre-encoded PyG Data objects in board_before/board_after
+    and uses branch_failed instead of failed.  This class returns items in the
+    same dict format that QWMTrainer._collate expects.
+    """
+
+    def __init__(self, traces):
+        from qwm.data.obstruction_labeler import OBSTRUCTION_CLASSES
+        self._obs_classes = OBSTRUCTION_CLASSES
+        self.traces = traces
+        self.merge_values = [0.0 if t.branch_failed else 1.0 for t in traces]
+
+    def __len__(self):
+        return len(self.traces)
+
+    def __getitem__(self, idx):
+        t = self.traces[idx]
+        obs_label = -1
+        if t.branch_failed and t.obstruction_type is not None:
+            obs_label = self._obs_classes.get(t.obstruction_type, -1)
+        return {
+            "graph_t": t.board_before,
+            "graph_t1": t.board_after,
+            "action": torch.tensor([0, 0], dtype=torch.long),
+            "obstruction_label": obs_label,
+            "merge_value": self.merge_values[idx],
+            "is_failed": t.branch_failed,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Train
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -107,13 +143,9 @@ def train():
 
     wrapped = _proof_traces_to_solver_traces(proof_traces)
 
-    # Build a minimal PairDataset using only the wrapped traces
-    # (no equivalence pairs for now — Phase 6 will add Lean-specific pairs)
-    from qwm.training.dataset import QWMDataset
     from torch.utils.data import DataLoader
 
-    # QWMDataset expects SolverTrace objects; use the wrapped ones
-    dataset = QWMDataset(wrapped)
+    dataset = LeanQWMDataset(wrapped)
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
