@@ -23,8 +23,8 @@ class Config:
     temperature: float = 0.07         # contrastive loss temperature
 
     # ── Loss weights ────────────────────────────────────────────────────
-    lambda_dyn: float = 1.0
-    lambda_quot: float = 0.5
+    lambda_dyn: float = 0.3
+    lambda_quot: float = 3.0
     lambda_obs: float = 0.3
     lambda_value: float = 0.1
 
